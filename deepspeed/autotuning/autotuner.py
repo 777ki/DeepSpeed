@@ -429,8 +429,8 @@ class Autotuner:
             f"The model requires at least {memory_to_string(self.activation_mem, postfix='B')} activation memory for micro batch size 1."
         )
 
-        #TODO: FIX THIS
-        stage = self.user_config.get(ZERO_OPTIMIZATION, {}).get(ZERO_OPTIMIZATION_STAGE, "all")
+        stage = self.user_config.get(ZERO_OPTIMIZATION, {}).get(ZERO_OPTIMIZATION_STAGE, 0)
+
         user_zero_stages = [stage] if not isinstance(stage, list) else stage
         logger.info(f"User-defined zero stages are {stage}.")
 
@@ -683,6 +683,7 @@ class Autotuner:
         exp_config[DS_CONFIG] = ds_config
         exp_config['num_gpus'] = self.exp_num_gpus
         exp_config['num_nodes'] = self.exp_num_nodes
+        exp_config['hostfile'] = self.args.hostfile
         exp_path = os.path.join(self.exps_dir, f'{exp_name}.json')
 
         with open(exp_path, 'w', buffering=BUFSIZE) as fd:
@@ -761,6 +762,7 @@ class Autotuner:
             exp_config[DS_CONFIG] = ds_config
             exp_config['num_gpus'] = self.exp_num_gpus
             exp_config['num_nodes'] = self.exp_num_nodes
+            exp_config['hostfile'] = self.args.hostfile
             exp_path = os.path.join(self.exps_dir, f'{exp_name}.json')
 
             with open(exp_path, 'w', buffering=BUFSIZE) as fd:
@@ -985,7 +987,7 @@ class Autotuner:
             if isinstance(gas_in_config, int):
                 gas = gas_in_config
             elif gas_in_config == "auto":  # GRADIENT_ACCUMULATION_STEPS: "auto"
-                val = self.get_val_from_config(GRADIENT_ACCUMULATION_STEPS)
+                val = self.get_val_from_user_args(GRADIENT_ACCUMULATION_STEPS)
                 if val:
                     gas = int(val)
             elif isinstance(gas_in_config, list):
@@ -1055,6 +1057,7 @@ class Autotuner:
         exp_config[DS_CONFIG] = ds_config
         exp_config['num_gpus'] = self.exp_num_gpus
         exp_config['num_nodes'] = self.exp_num_nodes
+        exp_config['hostfile'] = self.args.hostfile
         exp_path = os.path.join(self.exps_dir, f'{exp_name}.json')
 
         logger.debug(f'run_ds_config exp_name = {exp_name}')

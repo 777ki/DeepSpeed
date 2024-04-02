@@ -12,6 +12,16 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 from packaging import version as pkg_version
 
+# Skip Triton import for AMD due to pytorch-triton-rocm module breaking device API in DeepSpeed
+if not (hasattr(torch.version, 'hip') and torch.version.hip is not None):
+    try:
+        import triton  # noqa: F401 # type: ignore
+        HAS_TRITON = True
+    except ImportError:
+        HAS_TRITON = False
+else:
+    HAS_TRITON = False
+
 from . import ops
 from . import module_inject
 
@@ -32,7 +42,7 @@ from .utils import log_dist, OnDevice, logger
 from .comm.comm import init_distributed
 
 from .runtime import zero
-from .runtime import DeepSpeedOptimizer, ZeROOptimizer
+from .runtime.compiler import is_compile_supported
 
 from .pipe import PipelineModule
 
@@ -145,7 +155,7 @@ def initialize(args=None,
     if hasattr(args, "deepspeed_config") and args.deepspeed_config is not None:
         assert config is None, "Not sure how to proceed, we were given deepspeed configs in the deepspeed arguments and deepspeed.initialize() function call"
         config = args.deepspeed_config
-    assert config != None, "DeepSpeed requires --deepspeed_config to specify configuration file"
+    assert config is not None, "DeepSpeed requires --deepspeed_config to specify configuration file"
 
     if not isinstance(model, PipelineModule):
         config_class = DeepSpeedConfig(config, mpu)
@@ -189,6 +199,9 @@ def initialize(args=None,
                                 config=config,
                                 config_class=config_class)
 
+    # Restore zero.Init context if necessary
+    zero.partition_parameters.restore_init_context()
+
     return_items = [engine, engine.optimizer, engine.training_dataloader, engine.lr_scheduler]
     return tuple(return_items)
 
@@ -224,12 +237,6 @@ def _add_core_arguments(parser):
                        default=None,
                        type=str,
                        help='Deprecated DeepSpeed json configuration file.')
-
-    group.add_argument('--deepspeed_mpi',
-                       default=False,
-                       action='store_true',
-                       help="Run via MPI, this will attempt to discover the necessary variables to initialize torch "
-                       "distributed from the MPI environment")
 
     return parser
 
@@ -283,7 +290,7 @@ def init_inference(model, config=None, **kwargs):
     .. code-block:: python
 
         generator.model = deepspeed.init_inference(generator.model,
-                                                    mp_size=world_size,
+                                                    tensor_parallel={"tp_size": world_size},
                                                     dtype=torch.half,
                                                     replace_with_kernel_inject=True)
         string = generator("DeepSpeed is")

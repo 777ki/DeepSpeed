@@ -25,6 +25,9 @@ class CCLCommBuilder(CPUOpBuilder):
         includes = ['csrc/cpu/includes']
         return includes
 
+    def cxx_args(self):
+        return ['-O2', '-fopenmp']
+
     def is_compatible(self, verbose=True):
         # TODO: add soft compatibility check for private binary release.
         #  a soft check, as in we know it can be trivially changed.
@@ -32,7 +35,7 @@ class CCLCommBuilder(CPUOpBuilder):
 
     def extra_ldflags(self):
         ccl_root_path = os.environ.get("CCL_ROOT")
-        if ccl_root_path == None:
+        if ccl_root_path is None:
             raise ValueError(
                 "Didn't find CCL_ROOT, install oneCCL from https://github.com/oneapi-src/oneCCL and source its environment variable"
             )

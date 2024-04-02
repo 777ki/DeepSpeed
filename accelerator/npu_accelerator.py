@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
+import importlib
+import inspect
 
 from .abstract_accelerator import DeepSpeedAccelerator
 # During setup stage torch may not be installed, pass on no torch will
@@ -15,15 +17,29 @@ except ImportError:
 class NPU_Accelerator(DeepSpeedAccelerator):
 
     def __init__(self):
+        super().__init__()
         self._name = 'npu'
         self._communication_backend_name = 'hccl'
+        # dict that holds class name <--> class type mapping i.e.
+        # 'AsyncIOBuilder': <class 'op_builder.async_io.AsyncIOBuilder'>
+        # this dict will be filled at init stage
+        self.class_dict = None
 
     def is_synchronized_device(self):
         return False
 
+    def use_host_timers(self):
+        return self.is_synchronized_device()
+
+    def resolves_data_dependency(self):
+        return self.is_synchronized_device()
+
+    def handles_memory_backpressure(self):
+        return self.is_synchronized_device()
+
     # Device APIs
     def device_name(self, device_index=None):
-        if device_index == None:
+        if device_index is None:
             return 'npu'
         return 'npu:{}'.format(device_index)
 
@@ -132,12 +148,18 @@ class NPU_Accelerator(DeepSpeedAccelerator):
     def total_memory(self, device_index=None):
         return torch.npu.get_device_properties(device_index).total_memory
 
+    def available_memory(self, device_index=None):
+        return self.total_memory(device_index) - self.memory_allocated(device_index)
+
     # Data types
     def is_bf16_supported(self):
         return torch.npu.is_bf16_supported()
 
     def is_fp16_supported(self):
         return True
+
+    def supported_dtypes(self):
+        return [torch.float, torch.half, torch.bfloat16]
 
     # Misc
     def amp(self):
@@ -159,6 +181,20 @@ class NPU_Accelerator(DeepSpeedAccelerator):
 
     def communication_backend_name(self):
         return self._communication_backend_name
+
+    def is_triton_supported(self):
+        return False
+
+    # Graph operations
+    def create_graph(self):
+        return None
+
+    def capture_to_graph(self, graph, pool=None, stream=None):
+        from deepspeed.runtime.utils import noop_context
+        return noop_context()
+
+    def replay_graph(self, graph):
+        return
 
     # Tensor operations
 
@@ -190,8 +226,11 @@ class NPU_Accelerator(DeepSpeedAccelerator):
     def LongTensor(self):
         return torch.npu.LongTensor
 
-    def pin_memory(self, tensor):
+    def pin_memory(self, tensor, align_bytes=1):
         return tensor.pin_memory()
+
+    def is_pinned(self, tensor):
+        return tensor.is_pinned()
 
     def on_accelerator(self, tensor):
         device_str = str(tensor.device)
@@ -204,29 +243,26 @@ class NPU_Accelerator(DeepSpeedAccelerator):
         try:
             # is op_builder from deepspeed or a 3p version? this should only succeed if it's deepspeed
             # if successful this also means we're doing a local install and not JIT compile path
-            from op_builder import __deepspeed__  # noqa: F401
+            from op_builder import __deepspeed__  # noqa: F401 # type: ignore
             return "op_builder.npu"
         except ImportError:
             return "deepspeed.ops.op_builder.npu"
 
-    # dict that holds class name <--> class type mapping i.e.
-    # 'AsyncIOBuilder': <class 'op_builder.async_io.AsyncIOBuilder'>
-    # this dict will be filled at init stage
-    class_dict = None
-
     def _lazy_init_class_dict(self):
-        if self.class_dict != None:
+        if self.class_dict:
             return
-        else:
-            self.class_dict = {}
+
+        op_builder_module = importlib.import_module(self.op_builder_dir())
+
+        # get op builder class from op_builder/npu/__init__.py
+        self.class_dict = {}
+        for class_name, class_obj in inspect.getmembers(op_builder_module, inspect.isclass):
+            self.class_dict[class_name] = class_obj
 
     # create an instance of op builder and return, name specified by class_name
     def create_op_builder(self, class_name):
-        self._lazy_init_class_dict()
-        if class_name in self.class_dict:
-            return self.class_dict[class_name]()
-        else:
-            return None
+        builder_class = self.get_op_builder(class_name)
+        return None if builder_class is None else builder_class()
 
     # return an op builder class, name specified by class_name
     def get_op_builder(self, class_name):
@@ -234,8 +270,11 @@ class NPU_Accelerator(DeepSpeedAccelerator):
         if class_name in self.class_dict:
             return self.class_dict[class_name]
         else:
-            return None
+            return self.class_dict['NotImplementedBuilder'] if 'NotImplementedBuilder' in self.class_dict else None
 
     def build_extension(self):
         from torch.utils.cpp_extension import BuildExtension
         return BuildExtension
+
+    def export_envs(self):
+        return ['ASCEND', 'HCCL', 'LD_LIBRARY', 'PATH']

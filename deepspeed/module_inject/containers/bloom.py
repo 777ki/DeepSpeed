@@ -23,17 +23,27 @@ class DS_BloomContainer(MetaTensorContainer, HybridEngineContainer, BaseTransfor
 
         # All model specific things should be defined here instead of the base class.
         self.bigscience_bloom = True
+        self.triangular_masking = False
 
     def create_module(self, config=None):
         _config = config if config is not None else self.ds_model_config
 
         self.module = DeepSpeedBloomInference(_config, mp_group=self.mp_group)
         self.module.config.scale_attention = self.scale_attention
+        self.module.config.invert_mask = False
         return self.module
 
     def attention_qkv_mp(self, mp_replace, reversed_dim=False):
         self.module.attention.attn_qkvw = mp_replace.copy(self.module.attention.attn_qkvw, self.qkvw)
         self.module.attention.attn_qkvb = mp_replace.copy(self.module.attention.attn_qkvb, self.qkvb)
+
+    def get_lora_matched_pair(self):
+        """
+        Necessary to implement for `HybridEngineContainer`
+        """
+        fc1_lora, fc2_lora, qkv_lora, out_lora = self.get_lora_params()
+        ret = [(fc1_lora, self._h4h_w), (fc2_lora, self._4hh_w), (qkv_lora, self.qkvw), (out_lora, self.dense_w)]
+        return ret
 
     def set_lora_params(self):
         """

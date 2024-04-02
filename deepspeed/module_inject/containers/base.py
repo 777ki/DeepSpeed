@@ -8,6 +8,7 @@ from abc import ABC
 
 import torch
 
+import deepspeed
 from deepspeed.ops.transformer.inference.config import DeepSpeedInferenceConfig
 from deepspeed.accelerator import get_accelerator
 
@@ -79,6 +80,10 @@ class BaseTransformerContainer(ABC):
         self.input_nb = None
 
         self.mp_group = None
+        self.use_triton = False
+
+        # Triton
+        self.use_triton = config.use_triton and deepspeed.HAS_TRITON
 
     def create_ds_model_config(self):
         self.set_hidden_heads(*self.policy.get_hidden_heads())
@@ -110,7 +115,18 @@ class BaseTransformerContainer(ABC):
             use_mup=self.use_mup,
             return_single_tuple=self.return_single_tuple,
             set_empty_params=self.config.set_empty_params,
-            transposed_mode=self.config.transposed_mode)
+            transposed_mode=self.config.transposed_mode,
+            use_triton=self.use_triton,
+            triton_autotune=self.config.triton_autotune)
+
+        if self.use_triton and deepspeed.HAS_TRITON:
+            from .bert import DS_BERTContainer
+            if not isinstance(self, DS_BERTContainer):
+                raise NotImplementedError("Triton kernels are only for BERT-like models yet")
+
+            if not self.config.triton_autotune:
+                from deepspeed.ops.transformer.inference.triton.matmul_ext import fp16_matmul
+                fp16_matmul.skip_autotune()
 
         return self.ds_model_config
 
@@ -126,7 +142,7 @@ class BaseTransformerContainer(ABC):
         self.set_attention(*self.policy.attention(enable_training=enable_training))
         self.set_mlp(*self.policy.mlp(enable_training=enable_training))
         self.set_layernorm(*self.policy.layernorm())
-        self.check_meta_tensor_support()
+        #self.check_meta_tensor_support()
 
     def convert_to_required_dtype(self):
         # Note: converting tensors to fp16 requires that we do it in-place using self.__dict__ and not make a list/dict copy

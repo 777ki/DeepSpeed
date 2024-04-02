@@ -5,7 +5,7 @@
 
 # DeepSpeed Team
 
-# This script extracts fp32 consolidated weights from a zero 2 and 3 DeepSpeed checkpoints. It gets
+# This script extracts fp32 consolidated weights from a zero 1, 2 and 3 DeepSpeed checkpoints. It gets
 # copied into the top level checkpoint dir, so the user can easily do the conversion at any point in
 # the future. Once extracted, the weights don't require DeepSpeed and can be used in any
 # application.
@@ -63,7 +63,7 @@ def get_model_state_file(checkpoint_dir, zero_stage):
         raise FileNotFoundError(f"Directory '{checkpoint_dir}' doesn't exist")
 
     # there should be only one file
-    if zero_stage == 2:
+    if zero_stage <= 2:
         file = os.path.join(checkpoint_dir, "mp_rank_00_model_states.pt")
     elif zero_stage == 3:
         file = os.path.join(checkpoint_dir, "zero_pp_rank_0_mp_rank_00_model_states.pt")
@@ -143,7 +143,11 @@ def parse_optim_states(files, ds_checkpoint_dir):
     total_files = len(files)
     state_dicts = []
     for f in files:
-        state_dicts.append(torch.load(f, map_location=device))
+        state_dict = torch.load(f, map_location=device)
+        # immediately discard the potentially huge 2 optimizer states as we only care for fp32 master weights
+        # and also handle the case where it was already removed by another helper script
+        state_dict["optimizer_state_dict"].pop("optimizer_state_dict", None)
+        state_dicts.append(state_dict)
 
     if not ZERO_STAGE in state_dicts[0][OPTIMIZER_STATE_DICT]:
         raise ValueError(f"{files[0]} is not a zero checkpoint")
@@ -164,14 +168,14 @@ def parse_optim_states(files, ds_checkpoint_dir):
         )
 
     # the groups are named differently in each stage
-    if zero_stage == 2:
+    if zero_stage <= 2:
         fp32_groups_key = SINGLE_PARTITION_OF_FP32_GROUPS
     elif zero_stage == 3:
         fp32_groups_key = FP32_FLAT_GROUPS
     else:
         raise ValueError(f"unknown zero stage {zero_stage}")
 
-    if zero_stage == 2:
+    if zero_stage <= 2:
         fp32_flat_groups = [state_dicts[i][OPTIMIZER_STATE_DICT][fp32_groups_key] for i in range(len(state_dicts))]
     elif zero_stage == 3:
         # if there is more than one param group, there will be multiple flattened tensors - one
@@ -187,7 +191,7 @@ def parse_optim_states(files, ds_checkpoint_dir):
     return zero_stage, world_size, fp32_flat_groups
 
 
-def _get_fp32_state_dict_from_zero_checkpoint(ds_checkpoint_dir):
+def _get_fp32_state_dict_from_zero_checkpoint(ds_checkpoint_dir, exclude_frozen_parameters):
     """
     Returns fp32 state_dict reconstructed from ds checkpoint
 
@@ -206,10 +210,12 @@ def _get_fp32_state_dict_from_zero_checkpoint(ds_checkpoint_dir):
     zero_model_states = parse_model_states(model_files)
     print(f'Parsing checkpoint created by deepspeed=={zero_model_states[0].ds_version}')
 
-    if zero_stage == 2:
-        return _get_fp32_state_dict_from_zero2_checkpoint(world_size, fp32_flat_groups, zero_model_states)
+    if zero_stage <= 2:
+        return _get_fp32_state_dict_from_zero2_checkpoint(world_size, fp32_flat_groups, zero_model_states,
+                                                          exclude_frozen_parameters)
     elif zero_stage == 3:
-        return _get_fp32_state_dict_from_zero3_checkpoint(world_size, fp32_flat_groups, zero_model_states)
+        return _get_fp32_state_dict_from_zero3_checkpoint(world_size, fp32_flat_groups, zero_model_states,
+                                                          exclude_frozen_parameters)
 
 
 def _zero2_merge_frozen_params(state_dict, zero_model_states):
@@ -242,6 +248,11 @@ def _zero2_merge_frozen_params(state_dict, zero_model_states):
             print(f"{name} full shape: {shape} unpartitioned numel {unpartitioned_numel} ")
 
     print(f"Reconstructed Frozen fp32 state dict with {total_params} params {total_numel} elements")
+
+
+def _has_callable(obj, fn):
+    attr = getattr(obj, fn, None)
+    return callable(attr)
 
 
 def _zero2_merge_trainable_params(state_dict, world_size, fp32_flat_groups, zero_model_states):
@@ -283,7 +294,7 @@ def _zero2_merge_trainable_params(state_dict, world_size, fp32_flat_groups, zero
         avail_numel = full_single_fp32_vector.numel()
         for name, shape in shapes.items():
 
-            unpartitioned_numel = shape.numel()
+            unpartitioned_numel = shape.numel() if _has_callable(shape, 'numel') else math.prod(shape)
             total_numel += unpartitioned_numel
             total_params += 1
 
@@ -317,7 +328,8 @@ def _zero2_merge_trainable_params(state_dict, world_size, fp32_flat_groups, zero
     print(f"Reconstructed fp32 state dict with {total_params} params {total_numel} elements")
 
 
-def _get_fp32_state_dict_from_zero2_checkpoint(world_size, fp32_flat_groups, zero_model_states):
+def _get_fp32_state_dict_from_zero2_checkpoint(world_size, fp32_flat_groups, zero_model_states,
+                                               exclude_frozen_parameters):
     state_dict = OrderedDict()
 
     # buffers
@@ -326,7 +338,8 @@ def _get_fp32_state_dict_from_zero2_checkpoint(world_size, fp32_flat_groups, zer
     if debug:
         print(f"added {len(buffers)} buffers")
 
-    _zero2_merge_frozen_params(state_dict, zero_model_states)
+    if not exclude_frozen_parameters:
+        _zero2_merge_frozen_params(state_dict, zero_model_states)
 
     _zero2_merge_trainable_params(state_dict, world_size, fp32_flat_groups, zero_model_states)
 
@@ -435,7 +448,8 @@ def _zero3_merge_trainable_params(state_dict, world_size, fp32_flat_groups, zero
     print(f"Reconstructed Trainable fp32 state dict with {total_params} params {total_numel} elements")
 
 
-def _get_fp32_state_dict_from_zero3_checkpoint(world_size, fp32_flat_groups, zero_model_states):
+def _get_fp32_state_dict_from_zero3_checkpoint(world_size, fp32_flat_groups, zero_model_states,
+                                               exclude_frozen_parameters):
     state_dict = OrderedDict()
 
     # buffers
@@ -444,7 +458,8 @@ def _get_fp32_state_dict_from_zero3_checkpoint(world_size, fp32_flat_groups, zer
     if debug:
         print(f"added {len(buffers)} buffers")
 
-    _zero3_merge_frozen_params(state_dict, world_size, zero_model_states)
+    if not exclude_frozen_parameters:
+        _zero3_merge_frozen_params(state_dict, world_size, zero_model_states)
 
     _zero3_merge_trainable_params(state_dict, world_size, fp32_flat_groups, zero_model_states)
 
@@ -456,7 +471,7 @@ def _get_fp32_state_dict_from_zero3_checkpoint(world_size, fp32_flat_groups, zer
     return state_dict
 
 
-def get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir, tag=None):
+def get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir, tag=None, exclude_frozen_parameters=False):
     """
     Convert ZeRO 2 or 3 checkpoint into a single fp32 consolidated state_dict that can be loaded with
     ``load_state_dict()`` and used for training without DeepSpeed or shared with others, for example
@@ -465,6 +480,7 @@ def get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir, tag=None):
     Args:
         - ``checkpoint_dir``: path to the desired checkpoint folder
         - ``tag``: checkpoint tag used as a unique identifier for checkpoint. If not provided will attempt to load tag in 'latest' file. e.g., ``global_step14``
+        - ``exclude_frozen_parameters``: exclude frozen parameters
 
     Returns:
         - pytorch ``state_dict``
@@ -502,10 +518,10 @@ def get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir, tag=None):
     if not os.path.isdir(ds_checkpoint_dir):
         raise FileNotFoundError(f"Directory '{ds_checkpoint_dir}' doesn't exist")
 
-    return _get_fp32_state_dict_from_zero_checkpoint(ds_checkpoint_dir)
+    return _get_fp32_state_dict_from_zero_checkpoint(ds_checkpoint_dir, exclude_frozen_parameters)
 
 
-def convert_zero_checkpoint_to_fp32_state_dict(checkpoint_dir, output_file, tag=None):
+def convert_zero_checkpoint_to_fp32_state_dict(checkpoint_dir, output_file, tag=None, exclude_frozen_parameters=False):
     """
     Convert ZeRO 2 or 3 checkpoint into a single fp32 consolidated ``state_dict`` file that can be
     loaded with ``torch.load(file)`` + ``load_state_dict()`` and used for training without DeepSpeed.
@@ -514,9 +530,10 @@ def convert_zero_checkpoint_to_fp32_state_dict(checkpoint_dir, output_file, tag=
         - ``checkpoint_dir``: path to the desired checkpoint folder. (one that contains the tag-folder, like ``global_step14``)
         - ``output_file``: path to the pytorch fp32 state_dict output file (e.g. path/pytorch_model.bin)
         - ``tag``: checkpoint tag used as a unique identifier for checkpoint. If not provided will attempt to load tag in the file named ``latest`` in the checkpoint folder, e.g., ``global_step14``
+        - ``exclude_frozen_parameters``: exclude frozen parameters
     """
 
-    state_dict = get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir, tag)
+    state_dict = get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir, tag, exclude_frozen_parameters)
     print(f"Saving fp32 state dict to {output_file}")
     torch.save(state_dict, output_file)
 
@@ -570,9 +587,18 @@ if __name__ == "__main__":
         "output_file",
         type=str,
         help="path to the pytorch fp32 state_dict output file (e.g. path/checkpoint-12/pytorch_model.bin)")
+    parser.add_argument("-t",
+                        "--tag",
+                        type=str,
+                        default=None,
+                        help="checkpoint tag used as a unique identifier for checkpoint. e.g., global_step1")
+    parser.add_argument("--exclude_frozen_parameters", action='store_true', help="exclude frozen parameters")
     parser.add_argument("-d", "--debug", action='store_true', help="enable debug")
     args = parser.parse_args()
 
     debug = args.debug
 
-    convert_zero_checkpoint_to_fp32_state_dict(args.checkpoint_dir, args.output_file)
+    convert_zero_checkpoint_to_fp32_state_dict(args.checkpoint_dir,
+                                               args.output_file,
+                                               tag=args.tag,
+                                               exclude_frozen_parameters=args.exclude_frozen_parameters)

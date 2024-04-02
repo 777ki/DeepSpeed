@@ -193,7 +193,7 @@ class DeepSpeedMoEInference(nn.Module):
             specialized_mode = False
             # InferenceSpecializedBuilder is not among DeepSpeed provided builder yet, so we infer by builder name string
             builder = get_accelerator().create_op_builder("InferenceSpecializedBuilder")
-            if builder != None and builder.is_compatible():
+            if builder is not None and builder.is_compatible():
                 inference_module = builder.load()
                 specialized_mode = True
             else:
@@ -326,12 +326,12 @@ class DeepSpeedMoEInference(nn.Module):
                 res_coef_out = self.res_coef_func(attention_output, async_op=True)
 
             if self.expert_mp_group is not None:
-                tensor_list = [
-                    torch.empty_like(attention_output) for _ in range(dist.get_world_size(group=self.expert_mp_group))
-                ]
-                tensor_list[dist.get_rank(group=self.expert_mp_group)] = attention_output
-                dist.all_gather(tensor_list, attention_output, group=self.expert_mp_group)
-                attention_output = torch.cat(tensor_list).contiguous()
+                world_size = dist.get_world_size(group=self.expert_mp_group)
+                gather_buffer = torch.zeros(world_size * attention_output.numel(),
+                                            dtype=attention_output.dtype,
+                                            device=attention_output.device)
+                dist.all_gather_into_tensor(gather_buffer, attention_output, group=self.expert_mp_group)
+                attention_output = gather_buffer.view(-1, *attention_output.size()[1:])
 
             ############## MoE Gating + Experts ###############
             dispatched_attention, combined_weights = self.moe_gate_einsum(attention_output)

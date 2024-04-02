@@ -3,6 +3,7 @@
 
 # DeepSpeed Team
 
+import functools
 import os
 import pkgutil
 import importlib
@@ -15,19 +16,45 @@ try:
 except ImportError:
     pass
 
+# Delay import pynvml to avoid import error when CUDA is not available
+pynvml = None
+
 
 class CUDA_Accelerator(DeepSpeedAccelerator):
 
     def __init__(self):
         self._name = 'cuda'
         self._communication_backend_name = 'nccl'
+        if pynvml is None:
+            self._init_pynvml()
+
+    def _init_pynvml(self):
+        global pynvml
+        try:
+            import pynvml
+        except ImportError:
+            return
+        try:
+            pynvml.nvmlInit()
+        except pynvml.NVMLError:
+            pynvml = None
+            return
 
     def is_synchronized_device(self):
         return False
 
+    def use_host_timers(self):
+        return self.is_synchronized_device()
+
+    def resolves_data_dependency(self):
+        return self.is_synchronized_device()
+
+    def handles_memory_backpressure(self):
+        return self.is_synchronized_device()
+
     # Device APIs
     def device_name(self, device_index=None):
-        if device_index == None:
+        if device_index is None:
             return 'cuda'
         return 'cuda:{}'.format(device_index)
 
@@ -136,16 +163,58 @@ class CUDA_Accelerator(DeepSpeedAccelerator):
     def total_memory(self, device_index=None):
         return torch.cuda.get_device_properties(device_index).total_memory
 
+    def _get_nvml_gpu_id(self, torch_gpu_id):
+        """
+        credit: https://discuss.pytorch.org/t/making-pynvml-match-torch-device-ids-cuda-visible-devices/103020
+
+        Remap torch device id to nvml device id, respecting CUDA_VISIBLE_DEVICES.
+
+        If the latter isn't set return the same id
+        """
+        # if CUDA_VISIBLE_DEVICES is used automagically remap the id since pynvml ignores this env var
+        if "CUDA_VISIBLE_DEVICES" in os.environ:
+            ids = list(map(int, os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")))
+            return ids[torch_gpu_id]  # remap
+        else:
+            return torch_gpu_id
+
+    def available_memory(self, device_index=None):
+        if pynvml:
+            if device_index is None:
+                device_index = self.current_device()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(self._get_nvml_gpu_id(device_index))
+            info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            return info.free
+        else:
+            return self.total_memory(device_index) - self.memory_allocated(device_index)
+
     # Data types
     def is_bf16_supported(self):
+        if not torch.cuda.is_available():
+            return True
         return torch.cuda.is_bf16_supported()
 
     def is_fp16_supported(self):
+        if not torch.cuda.is_available():
+            return True
+        # See https://docs.nvidia.com/deeplearning/tensorrt/support-matrix/index.html#hardware-precision-matrix
+        # FP16 on compute capability 6.x is deprecated
+        allow_deprecated_fp16 = os.environ.get('DS_ALLOW_DEPRECATED_FP16', '0') == '1'
         major, _ = torch.cuda.get_device_capability()
         if major >= 7:
             return True
+        elif major == 6 and allow_deprecated_fp16:
+            return True
         else:
             return False
+
+    def supported_dtypes(self):
+        supported_dtypes = [torch.float]
+        if self.is_fp16_supported():
+            supported_dtypes.append(torch.half)
+        if self.is_bf16_supported():
+            supported_dtypes.append(torch.bfloat16)
+        return supported_dtypes
 
     # Misc
     def amp(self):
@@ -170,38 +239,59 @@ class CUDA_Accelerator(DeepSpeedAccelerator):
     def communication_backend_name(self):
         return self._communication_backend_name
 
+    def is_triton_supported(self):
+        major, _ = torch.cuda.get_device_capability()
+        if major >= 8:
+            return True
+        else:
+            return False
+
+    # Graph operations
+    def create_graph(self):
+        return torch.cuda.CUDAGraph()
+
+    def capture_to_graph(self, graph, pool=None, stream=None):
+        return torch.cuda.graph(graph, pool, stream)
+
+    def replay_graph(self, graph):
+        graph.replay()
+        return
+
     # Tensor operations
 
     @property
     def BFloat16Tensor(self):
-        return torch.cuda.BFloat16Tensor
+        return functools.partial(torch.tensor, dtype=torch.bfloat16, device='cuda')
 
     @property
     def ByteTensor(self):
-        return torch.cuda.ByteTensor
+        return functools.partial(torch.tensor, dtype=torch.uint8, device='cuda')
 
     @property
     def DoubleTensor(self):
-        return torch.cuda.DoubleTensor
+        return functools.partial(torch.tensor, dtype=torch.double, device='cuda')
 
     @property
     def FloatTensor(self):
-        return torch.cuda.FloatTensor
+        return functools.partial(torch.tensor, dtype=torch.float, device='cuda')
 
     @property
     def HalfTensor(self):
-        return torch.cuda.HalfTensor
+        return functools.partial(torch.tensor, dtype=torch.half, device='cuda')
 
     @property
     def IntTensor(self):
-        return torch.cuda.IntTensor
+        return functools.partial(torch.tensor, dtype=torch.int, device='cuda')
 
     @property
     def LongTensor(self):
-        return torch.cuda.LongTensor
+        return functools.partial(torch.tensor, dtype=torch.long, device='cuda')
 
-    def pin_memory(self, tensor):
+    def pin_memory(self, tensor, align_bytes=1):
         return tensor.pin_memory()
+
+    def is_pinned(self, tensor):
+        return tensor.is_pinned()
 
     def on_accelerator(self, tensor):
         device_str = str(tensor.device)
@@ -214,7 +304,7 @@ class CUDA_Accelerator(DeepSpeedAccelerator):
         try:
             # is op_builder from deepspeed or a 3p version? this should only succeed if it's deepspeed
             # if successful this also means we're doing a local install and not JIT compile path
-            from op_builder import __deepspeed__  # noqa: F401
+            from op_builder import __deepspeed__  # noqa: F401 # type: ignore
             return "op_builder"
         except ImportError:
             return "deepspeed.ops.op_builder"
@@ -225,7 +315,7 @@ class CUDA_Accelerator(DeepSpeedAccelerator):
     class_dict = None
 
     def _lazy_init_class_dict(self):
-        if self.class_dict != None:
+        if self.class_dict is not None:
             return
         else:
             self.class_dict = {}
@@ -233,9 +323,12 @@ class CUDA_Accelerator(DeepSpeedAccelerator):
             # put all valid class name <--> class type mapping into class_dict
             op_builder_dir = self.op_builder_dir()
             op_builder_module = importlib.import_module(op_builder_dir)
-            for _, module_name, _ in pkgutil.iter_modules([os.path.dirname(op_builder_module.__file__)]):
-                # avoid self references
-                if module_name != 'all_ops' and module_name != 'builder' and module_name != 'cpu':
+            op_builder_absolute_path = os.path.dirname(op_builder_module.__file__)
+            for _, module_name, _ in pkgutil.iter_modules([op_builder_absolute_path]):
+                # avoid self references,
+                # skip sub_directories which contains ops for other backend(cpu, npu, etc.).
+                if module_name != 'all_ops' and module_name != 'builder' and not os.path.isdir(
+                        os.path.join(op_builder_absolute_path, module_name)):
                     module = importlib.import_module("{}.{}".format(op_builder_dir, module_name))
                     for member_name in module.__dir__():
                         if member_name.endswith(
@@ -264,3 +357,6 @@ class CUDA_Accelerator(DeepSpeedAccelerator):
     def build_extension(self):
         from torch.utils.cpp_extension import BuildExtension
         return BuildExtension
+
+    def export_envs(self):
+        return ['NCCL']
